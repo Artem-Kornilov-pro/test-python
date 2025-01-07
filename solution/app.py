@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2 import sql
 import os
 from dotenv import load_dotenv
-from werkzeug.security import generate_password_hash, check_password_hash
+#from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from datetime import datetime, timedelta
 import bcrypt
@@ -31,23 +31,16 @@ postgres_database = os.getenv("POSTGRES_DATABASE")
 postgres_host = os.getenv("POSTGRES_HOST")
 
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
+def create_access_token(data: dict, token_version: int, expires_delta: timedelta = None):
     """
-    Создает JWT токен на основе предоставленных данных и времени жизни токена.
-
-    Args:
-        data (dict): Данные, которые будут зашифрованы в токене.
-        expires_delta (timedelta, optional): Время жизни токена. Если не указано, используется значение по умолчанию.
-
-    Returns:
-        str: Зашифрованный JWT токен.
+    Создает JWT токен на основе предоставленных данных, версии токена и времени жизни токена.
     """
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "token_version": token_version})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -232,7 +225,7 @@ def auth_sign_in():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        sql.SQL("SELECT id, login, password_hash FROM users WHERE login = %s"),
+        sql.SQL("SELECT id, login, password_hash, token_version FROM users WHERE login = %s"),
         [login]
     )
     user = cur.fetchone()
@@ -242,14 +235,112 @@ def auth_sign_in():
     if user is None:
         return jsonify({"error": "Invalid login or password"}), 401
 
-    user_id, db_login, db_password_hash = user
+    user_id, db_login, db_password_hash, token_version = user
     if not bcrypt.checkpw(password.encode('utf-8'), db_password_hash.encode('utf-8')):
         return jsonify({"error": "Invalid login or password"}), 401
 
     token_data = {"sub": str(user_id), "login": db_login}
-    token = create_access_token(token_data)
+    token = create_access_token(token_data, token_version=token_version)
 
     return jsonify({"token": token}), 200
+
+
+
+@app.route("/api/me/updatePassword", methods=["POST"])
+def update_password():
+    """
+    Эндпоинт для обновления пароля пользователя.
+
+    Описание:
+    Этот эндпоинт позволяет пользователю обновить свой пароль. 
+    Старый пароль проверяется на соответствие текущему значению в базе данных, 
+    а новый пароль сохраняется после успешной проверки. Все существующие токены пользователя 
+    становятся недействительными за счет увеличения версии токена.
+
+    Требования:
+    - В заголовке `Authorization` должен быть передан Bearer токен.
+    - В теле запроса (JSON) должны быть указаны:
+        - `old_password` (строка) — текущий пароль.
+        - `new_password` (строка) — новый пароль.
+
+    Логика работы:
+    1. Токен из заголовка проверяется на валидность.
+    2. Старый пароль сверяется с хэшем, хранящимся в базе данных.
+    3. Новый пароль хэшируется и сохраняется.
+    4. Версия токена обновляется для инвалидации старых токенов.
+
+    Возвращает:
+    - 200 OK: Если пароль успешно обновлен.
+    - 401 Unauthorized: Если токен недействителен, истек или неверный.
+    - 400 Bad Request: Если отсутствуют обязательные поля в запросе.
+    - 500 Internal Server Error: В случае непредвиденной ошибки.
+
+    Исключения:
+    - `jwt.ExpiredSignatureError`: Токен истек.
+    - `jwt.InvalidTokenError`: Токен недействителен.
+    """
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "Authorization token is missing or invalid"}), 401
+
+    token = auth_header.split(' ')[1]
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        token_version = payload.get("token_version")
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token has expired"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+
+    if not old_password or not new_password:
+        return jsonify({"error": "Old password and new password are required"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        # Получение информации о пользователе
+        cur.execute('SELECT id, password_hash, token_version FROM users WHERE id = %s', (user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            return jsonify({"error": "User not found"}), 401
+
+        db_user_id, db_password_hash, db_token_version = user
+
+        # Проверка токена на соответствие версии
+        if db_token_version != token_version:
+            return jsonify({"error": "Token version mismatch"}), 401
+
+        # Проверка старого пароля
+        if not bcrypt.checkpw(old_password.encode('utf-8'), db_password_hash.encode('utf-8')):
+            return jsonify({"error": "Old password is incorrect"}), 401
+
+        # Хеширование нового пароля
+        new_password_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        # Обновление пароля и версии токена в базе данных
+        cur.execute(
+            'UPDATE users SET password_hash = %s, token_version = token_version + 1 WHERE id = %s',
+            (new_password_hash, user_id)
+        )
+        conn.commit()
+
+        return jsonify({"message": "Password updated successfully!"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 if __name__ == "__main__":
